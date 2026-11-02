@@ -87,7 +87,7 @@ USE_PROXY = len(PROXY_LIST) > 0  # env-only flag at boot; live check uses bool(P
 TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 SESSION = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=0)  # lookup() does its own retries
 SESSION.mount("http://", _adapter)
 SESSION.mount("https://", _adapter)
 
@@ -210,7 +210,7 @@ def test_proxy(url, cfg, vehicle="HR76E2990"):
         r = SESSION.get(cfg["url_template"].replace("{VEH}", vehicle), proxies=px, timeout=(8, 25))
         ms = int((time.time() - t0) * 1000)
         if _extract_json(r.text) is not None:
-            return True, f"API reply OK in {ms} ms"
+            return True, f"API reply OK in {ms} ms (HTTP {r.status_code})"
         return False, f"proxy works but API sent no JSON (HTTP {r.status_code})"
     except requests.exceptions.ProxyError as e:
         if "407" in str(e) or "auth" in str(e).lower():
@@ -455,7 +455,7 @@ def pick_route(cfg, vehicle):
     mode = None
     try:
         r = fetch(cfg["url_template"].replace("{VEH}", vehicle), "direct", timeout=(5, 12))
-        if r.status_code < 500 and _extract_json(r.text) is not None:
+        if _extract_json(r.text) is not None:
             mode = "direct"
     except Exception:
         pass
@@ -473,19 +473,25 @@ def lookup(vehicle, cfg, mode, delay=0.0, retries=3):
         time.sleep(delay)
     out = {"vehicle_number": vehicle, "mobile_number": "", "success": False, "limit_hit": False, "error": False}
     target = cfg["url_template"].replace("{VEH}", vehicle)
+    busy = False
     for attempt in range(retries):
         try:
+            busy = False
             r = fetch(target, mode)
-            if r.status_code in (429, 451, 502, 503, 504) or (mode == "relay" and r.status_code >= 500):
-                raise ValueError("transient")
             data = _extract_json(r.text)
+            # API answers "No data found" with HTTP 502 -> that's a definitive empty, not a network error
+            api_empty = isinstance(data, dict) and "no data" in str(data.get("message", "")).lower()
+            if not api_empty and (r.status_code in (429, 451, 502, 503, 504) or (mode == "relay" and r.status_code >= 500)):
+                busy = r.status_code in (429, 503)  # API itself overloaded, route is fine
+                raise ValueError("transient")
             if not isinstance(data, dict):
                 raise ValueError("no json")
         except Exception:
             if attempt < retries - 1:
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep((1.0 if busy else 0.3) * (attempt + 1))
                 continue
             out["error"] = True
+            out["busy"] = busy
             return out
         blob = str(data).lower()
         if data.get("code") == "KEY_LIMIT_REACHED" or "api key limit" in blob \
@@ -505,10 +511,11 @@ STOP_KB = {"inline_keyboard": [[{"text": "⛔ STOP / CANCEL", "callback_data": "
 CANCEL = {}  # chat_id -> threading.Event of the running scan
 
 
-def _progress_text(checked, found, target, last_plate, started):
+def _progress_text(checked, found, target, last_plate, started, par=None):
     secs = max(int(time.time() - started), 1)
+    p = f" · 🔧 {par} parallel" if par else ""
     return (f"⏳ 𝗟𝗜𝗩𝗘 𝗣𝗥𝗢𝗚𝗥𝗘𝗦𝗦\n━━━━━━━━━━━━━━━━\n🚗 Checked: {checked}\n✅ Found: {found}/{target}\n"
-            f"📍 At: {last_plate}\n⚡ Speed: {checked * 60 // secs}/min · ⏱️ {secs}s\n\n⛔ Stop: button below or /exit")
+            f"📍 At: {last_plate}\n⚡ Speed: {checked * 60 // secs}/min · ⏱️ {secs}s{p}\n\n⛔ Stop: button below or /exit")
 
 
 def _fallback(mode):
@@ -530,15 +537,36 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
     ahead = workers * 2
     prog_id = (send(chat_id, _progress_text(0, 0, target, last_plate, started), STOP_KB).get("result") or {}).get("message_id")
     ex = ThreadPoolExecutor(max_workers=workers)
+    # auto-speed: API busy/errors -> fewer parallel requests, smooth replies -> slowly back up
+    lim = {"v": float(workers)}
+    lim_lock = threading.Lock()
+
+    def _feedback(f):
+        try:
+            r = f.result()
+        except Exception:
+            return
+        with lim_lock:
+            lim["v"] = max(2.0, lim["v"] * 0.7) if r.get("error") else min(float(workers), lim["v"] + 0.25)
+
+    rx = ThreadPoolExecutor(max_workers=4)  # retries get their own lane, never wait behind the queue
+
+    def _submit(p, delay=0.0, retry=False):
+        f = (rx if retry else ex).submit(lookup, p, cfg, state["mode"], delay)
+        f.add_done_callback(_feedback)
+        return f
+
     try:
         while len(found) < target and checked < RC_MAX_SCAN:
             if ev.is_set():
                 state["cancel"] = True
                 break
-            while len(q) < ahead and nxt < RC_MAX_SCAN:
+            running = sum(1 for it in q if not it[2].done())
+            while len(q) < ahead and nxt < RC_MAX_SCAN and running < int(lim["v"]):
                 p = f"{prefix}{str(start + nxt).zfill(width)}"
-                q.append([p, 0, ex.submit(lookup, p, cfg, state["mode"])])
+                q.append([p, 0, _submit(p)])
                 nxt += 1
+                running += 1
             item = q[0]
             try:
                 res = item[2].result(timeout=1)
@@ -546,7 +574,7 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
                 res = None
             if res is not None:
                 if res.get("error"):
-                    streak += 1
+                    streak += 0 if res.get("busy") else 1  # API busy is not a route failure
                     nxt_mode = _fallback(state["mode"]) if streak >= SWITCH_AFTER else None
                     if nxt_mode:
                         send(chat_id, f"🔀 {state['mode'].upper()} route failing → switching to {nxt_mode.upper()} "
@@ -560,8 +588,8 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
                     if item[1] >= RETRY_ROUNDS:
                         state["net"] = True
                         break
-                    item[1] += 1
-                    item[2] = ex.submit(lookup, item[0], cfg, state["mode"], min(0.5 * item[1], 3))
+                    item[1] += 0.5 if res.get("busy") else 1
+                    item[2] = _submit(item[0], min((1.5 if res.get("busy") else 0.5) * item[1], 6), retry=True)
                 else:
                     streak = 0
                     q.popleft()
@@ -574,11 +602,12 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
                         found.append(res)
             if prog_id and time.time() - last_ping >= PROGRESS_EVERY:
                 tg("editMessageText", chat_id=chat_id, message_id=prog_id, reply_markup=STOP_KB,
-                   text=_progress_text(checked, len(found), target, last_plate, started))
+                   text=_progress_text(checked, len(found), target, last_plate, started, int(lim["v"])))
                 last_ping = time.time()
     finally:
         ev.set()  # wakes nothing, just marks scan over
         ex.shutdown(wait=False, cancel_futures=True)
+        rx.shutdown(wait=False, cancel_futures=True)
     if prog_id:
         tg("editMessageText", chat_id=chat_id, message_id=prog_id,
            text=_progress_text(checked, len(found), target, last_plate, started).split("\n\n⛔")[0] + "\n\n🏁 Scan finished")
