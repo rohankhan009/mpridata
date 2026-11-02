@@ -17,7 +17,8 @@ Folder ke andar:
 | `TELEGRAM_BOT_TOKEN` | ✅ haan | @BotFather se mila token |
 | `SUPER_ADMINS` | optional | permanent admin chat id(s), comma se. Default `8922842091` |
 | `RELAY_PREFIX` | optional | `https://r.jina.ai/` — datacenter IP block bypass. Agar aapka server IP API ko allowed hai to **khaali** kar do (direct = bahut fast) |
-| `MAX_WORKERS` | optional | jitna bada, utna fast. Default `6`. Bada VPS → `15`-`20` |
+| `MAX_WORKERS` | optional | parallel requests. Default `25` (relay bina Jina key ke auto 8) |
+| `TRANSPORT` | optional | `auto` (default): pehle DIRECT try, block ho to proxy → relay. Force: `direct`/`relay`/`proxy` |
 | `JINA_API_KEY` | optional | bade bulk ke liye relay ka rate limit badhane ko |
 | `RC_DB` | optional | sqlite file path, default `rc_bot.db` |
 
@@ -52,7 +53,7 @@ pip3 install -r requirements.txt
 # 2. env set karo
 export TELEGRAM_BOT_TOKEN="123456:ABC..."
 export RELAY_PREFIX="https://r.jina.ai/"   # IP allowed ho to hata do
-export MAX_WORKERS="15"                      # bada VPS = zyada
+export MAX_WORKERS="25"
 
 # 3. test chalao
 python3 rc_bot.py
@@ -69,7 +70,7 @@ After=network.target
 WorkingDirectory=/root/rcbot
 Environment=TELEGRAM_BOT_TOKEN=123456:ABC...
 Environment=RELAY_PREFIX=https://r.jina.ai/
-Environment=MAX_WORKERS=15
+Environment=MAX_WORKERS=25
 ExecStart=/usr/bin/python3 /root/rcbot/rc_bot.py
 Restart=always
 
@@ -116,3 +117,16 @@ sudo journalctl -u rcbot -f     # logs
    karega. Phir bhi na chale to service → Settings → **Start Command** mein
    `python rc_bot.py` daal do.
 
+
+
+## ⚡ v3 Fast mode
+- `TRANSPORT=auto` (default): bot khud check karta hai VPS se API direct chalti hai ya nahi. Chal gayi = relay ki zarurat NAHI (sabse fast).
+- Non-stop pipeline: 25 request hamesha chalti rehti hain, koi batch wait nahi. Skip phir bhi zero.
+- Har 10 sec live count (ek hi message update hota hai) + ⛔ STOP button.
+- `/exit` (ya `/stop`) = scan turant band, ab tak ke numbers CSV me mil jayenge.
+
+## ▶️ v4
+- `/resume` = last scan jahan ruka tha (STOP / limit / network) wahi gaadi se, bache hue numbers ke liye. Koi gap ya duplicate nahi.
+- Auto route switch: scan ke beech DIRECT fail ho (lagatar 6 errors) to PROXY pe, woh bhi fail to RELAY pe — usi gaadi se continue.
+- Daily report: raat 10 baje (IST) sab admins ko 24 ghante ka summary (scans, numbers, top 5 users). Kabhi bhi: `/report`.
+- Optional env: `SWITCH_AFTER=6`, `REPORT_HOUR=22`.

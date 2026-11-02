@@ -31,7 +31,11 @@ RUN
      RELAY_PREFIX         (optional; default https://r.jina.ai/ to bypass
                            datacenter IP blocks. Set to empty if your IP is
                            allowed by the API -> much faster.)
-     MAX_WORKERS          (optional; higher = faster. Default 6. Big VPS -> 15-20)
+     TRANSPORT            (optional; auto (default) = try DIRECT first, if the API
+                           blocks this server -> proxy -> relay. Or force direct/relay/proxy)
+     MAX_WORKERS          (optional; parallel requests. Default 25)
+     PROGRESS_EVERY       (optional; live count every N seconds, default 10)
+  User: /exit (or STOP button) stops a running scan and sends found numbers.
      JINA_API_KEY         (optional; higher relay rate limit for big bulk)
      RC_DB                (optional; sqlite path, default rc_bot.db)
   python rc_bot.py
@@ -46,8 +50,10 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from concurrent.futures import TimeoutError as FutureTimeout
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -55,7 +61,14 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9010080670:AAFMS2pHpKFWKaW3hYoefBcTxFObzNtJjro").strip()
 SUPER_ADMINS = os.environ.get("SUPER_ADMINS", "8922842091")
 RELAY_PREFIX = os.environ.get("RELAY_PREFIX", "https://r.jina.ai/").strip()
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "6"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
+TRANSPORT = os.environ.get("TRANSPORT", "auto").strip().lower()  # auto | direct | relay | proxy
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "6"))
+READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "20"))
+RETRY_ROUNDS = int(os.environ.get("RETRY_ROUNDS", "12"))
+PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", "10"))
+SWITCH_AFTER = int(os.environ.get("SWITCH_AFTER", "6"))  # consecutive failures before changing route mid-scan
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "22"))  # daily admin report, India time (IST)
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "").strip()
 RC_DB = os.environ.get("RC_DB", "rc_bot.db")
 RC_MAX_SCAN = int(os.environ.get("RC_MAX_SCAN", "1000000"))
@@ -107,6 +120,12 @@ def db_init():
             CREATE TABLE IF NOT EXISTS users(
                 chat_id INTEGER PRIMARY KEY, lim INTEGER DEFAULT 0,
                 used INTEGER DEFAULT 0, name TEXT, username TEXT);
+            CREATE TABLE IF NOT EXISTS scans(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, requester TEXT,
+                start_plate TEXT, last_plate TEXT, target INTEGER, found INTEGER,
+                checked INTEGER, status TEXT, ts REAL);
+            CREATE TABLE IF NOT EXISTS resume_state(
+                chat_id INTEGER PRIMARY KEY, next_plate TEXT, remaining INTEGER, ts REAL);
             """
         )
         _db.commit()
@@ -230,6 +249,33 @@ def activate_api(idx):
     return target
 
 
+def log_scan(chat_id, requester, start_plate, last_plate, target, found, checked, status):
+    with _lock:
+        _db.execute("INSERT INTO scans(chat_id,requester,start_plate,last_plate,target,found,checked,status,ts) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (chat_id, requester, start_plate, last_plate, target, found, checked, status, time.time()))
+        _db.commit()
+
+
+def save_resume(chat_id, next_plate, remaining):
+    with _lock:
+        _db.execute("INSERT OR REPLACE INTO resume_state(chat_id,next_plate,remaining,ts) VALUES(?,?,?,?)",
+                    (chat_id, next_plate, remaining, time.time()))
+        _db.commit()
+
+
+def get_resume(chat_id):
+    with _lock:
+        r = _db.execute("SELECT * FROM resume_state WHERE chat_id=?", (chat_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def clear_resume(chat_id):
+    with _lock:
+        _db.execute("DELETE FROM resume_state WHERE chat_id=?", (chat_id,))
+        _db.commit()
+
+
 # ----------------------------- Telegram --------------------------------------
 def tg(method, **payload):
     try:
@@ -239,7 +285,9 @@ def tg(method, **payload):
         return {"ok": False}
 
 
-def send(chat_id, text):
+def send(chat_id, text, reply_markup=None):
+    if reply_markup:
+        return tg("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
     return tg("sendMessage", chat_id=chat_id, text=text)
 
 
@@ -300,35 +348,64 @@ def _extract_json(text):
     return None
 
 
-def lookup(vehicle, cfg, retries=3):
+def _build(target, mode):
+    if mode == "relay":
+        h = {"X-Return-Format": "text"}
+        if JINA_API_KEY:
+            h["Authorization"] = "Bearer " + JINA_API_KEY
+        return RELAY_PREFIX + target, h, None
+    if mode == "proxy":
+        return target, {}, _pick_proxy()
+    return target, {}, None
+
+
+def fetch(target, mode, timeout=None):
+    url, h, px = _build(target, mode)
+    return SESSION.get(url, timeout=timeout or (CONNECT_TIMEOUT, READ_TIMEOUT), headers=h, proxies=px)
+
+
+_route = {"mode": None, "at": 0.0}
+
+
+def pick_route(cfg, vehicle):
+    # auto: try DIRECT first (fastest, works on most VPS). Blocked -> proxy -> relay.
+    if TRANSPORT in ("direct", "relay") or (TRANSPORT == "proxy" and USE_PROXY):
+        return TRANSPORT
+    if _route["mode"] and time.time() - _route["at"] < 600:
+        return _route["mode"]
+    mode = None
+    try:
+        r = fetch(cfg["url_template"].replace("{VEH}", vehicle), "direct", timeout=(5, 12))
+        if r.status_code < 500 and _extract_json(r.text) is not None:
+            mode = "direct"
+    except Exception:
+        pass
+    if not mode:
+        mode = "proxy" if USE_PROXY else ("relay" if RELAY_PREFIX else "direct")
+    _route.update(mode=mode, at=time.time())
+    print("route selected:", mode, flush=True)
+    return mode
+
+
+def lookup(vehicle, cfg, mode, delay=0.0, retries=3):
     # out["error"]=True means we NEVER got a valid response (transient/proxy fail)
     # -> caller must re-queue it, NOT treat as "no data" (prevents skips).
+    if delay:
+        time.sleep(delay)
     out = {"vehicle_number": vehicle, "mobile_number": "", "success": False, "limit_hit": False, "error": False}
     target = cfg["url_template"].replace("{VEH}", vehicle)
-    use_relay = RELAY_PREFIX and not USE_PROXY
-    url = (RELAY_PREFIX + target) if use_relay else target
-    headers = {"X-Return-Format": "text"} if use_relay else {}
-    if use_relay and JINA_API_KEY:
-        headers["Authorization"] = "Bearer " + JINA_API_KEY
     for attempt in range(retries):
         try:
-            proxies = _pick_proxy() if USE_PROXY else None
-            r = SESSION.get(url, timeout=(10, 45), headers=headers, proxies=proxies)
-            if r.status_code in (429, 451, 502, 503, 504) or (use_relay and r.status_code >= 500):
+            r = fetch(target, mode)
+            if r.status_code in (429, 451, 502, 503, 504) or (mode == "relay" and r.status_code >= 500):
                 raise ValueError("transient")
-            body = r.text.strip()
-            if not body:
-                raise ValueError("empty")
-            data = _extract_json(body)
-            if data is None:
+            data = _extract_json(r.text)
+            if not isinstance(data, dict):
                 raise ValueError("no json")
         except Exception:
             if attempt < retries - 1:
-                time.sleep(0.3 * (attempt + 1))  # retry, rotate to another proxy
+                time.sleep(0.3 * (attempt + 1))
                 continue
-            out["error"] = True  # could not get a definitive answer
-            return out
-        if not isinstance(data, dict):
             out["error"] = True
             return out
         blob = str(data).lower()
@@ -345,77 +422,116 @@ def lookup(vehicle, cfg, retries=3):
     return out
 
 
-def resolve_plates(plates, cfg):
-    """Return (results_by_plate, limit_hit). Errored plates are retried across
-    several rounds (rotating proxies) so a flaky network NEVER causes a skip.
-    Even if a limit response appears, flaky plates BEFORE it keep retrying, so
-    data plates are resolved; limit plates are marked so run_bulk stops at them."""
-    pending = list(plates)
-    results = {}
-    limit_hit = False
-    for _ in range(12):  # up to 12 rounds of re-queue for stubborn/flaky ones
-        if not pending:
-            break
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            outs = list(ex.map(lambda v: lookup(v, cfg), pending))
-        nxt = []
-        for v, res in zip(pending, outs):
-            if res.get("limit_hit"):
-                limit_hit = True
-                results[v] = res  # mark this plate as a limit boundary
-            elif res.get("error"):
-                nxt.append(v)  # retry next round (flaky) — do NOT give up
-            else:
-                results[v] = res  # definitive data / empty
-        pending = nxt
-        if pending:
-            time.sleep(0.5)
-    # Anything still failing after all rounds is left ABSENT (not marked empty),
-    # so run_bulk stops honestly at it instead of silently skipping a possible data plate.
-    return results, limit_hit
+STOP_KB = {"inline_keyboard": [[{"text": "⛔ STOP / CANCEL", "callback_data": "stop_scan"}]]}
+CANCEL = {}  # chat_id -> threading.Event of the running scan
 
 
-def run_bulk(chat_id, vehicle, target, requester=""):
+def _progress_text(checked, found, target, last_plate, started):
+    secs = max(int(time.time() - started), 1)
+    return (f"⏳ 𝗟𝗜𝗩𝗘 𝗣𝗥𝗢𝗚𝗥𝗘𝗦𝗦\n━━━━━━━━━━━━━━━━\n🚗 Checked: {checked}\n✅ Found: {found}/{target}\n"
+            f"📍 At: {last_plate}\n⚡ Speed: {checked * 60 // secs}/min · ⏱️ {secs}s\n\n⛔ Stop: button below or /exit")
+
+
+def _fallback(mode):
+    # direct -> proxy -> relay
+    chain = [m for m in ("direct", "proxy", "relay")
+             if m == "direct" or (m == "proxy" and USE_PROXY) or (m == "relay" and RELAY_PREFIX)]
+    return chain[chain.index(mode) + 1] if mode in chain and chain.index(mode) + 1 < len(chain) else None
+
+
+def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
+    # Streaming pipeline: always MAX_WORKERS requests in flight, results consumed
+    # strictly in plate order -> no skip, correct pairing, no batch waiting.
+    found, checked, last_plate = [], 0, f"{prefix}{str(start).zfill(width)}"
+    state = {"limit": False, "net": False, "cancel": False, "mode": mode}
+    streak = 0
+    q, nxt, last_ping = deque(), 0, time.time()
+    workers = min(MAX_WORKERS, 8) if (mode == "relay" and not JINA_API_KEY) else MAX_WORKERS  # free relay is rate-limited
+    ahead = workers * 2
+    prog_id = (send(chat_id, _progress_text(0, 0, target, last_plate, started), STOP_KB).get("result") or {}).get("message_id")
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        while len(found) < target and checked < RC_MAX_SCAN:
+            if ev.is_set():
+                state["cancel"] = True
+                break
+            while len(q) < ahead and nxt < RC_MAX_SCAN:
+                p = f"{prefix}{str(start + nxt).zfill(width)}"
+                q.append([p, 0, ex.submit(lookup, p, cfg, state["mode"])])
+                nxt += 1
+            item = q[0]
+            try:
+                res = item[2].result(timeout=1)
+            except FutureTimeout:
+                res = None
+            if res is not None:
+                if res.get("error"):
+                    streak += 1
+                    nxt_mode = _fallback(state["mode"]) if streak >= SWITCH_AFTER else None
+                    if nxt_mode:
+                        send(chat_id, f"🔀 {state['mode'].upper()} route failing → switching to {nxt_mode.upper()} "
+                                      f"(continuing from {item[0]}, nothing skipped)")
+                        print("route switch:", state["mode"], "->", nxt_mode, flush=True)
+                        state["mode"] = nxt_mode
+                        _route.update(mode=nxt_mode, at=time.time())
+                        if nxt_mode == "relay" and not JINA_API_KEY:
+                            ahead = min(ahead, 8)
+                        streak, item[1] = 0, 0
+                    if item[1] >= RETRY_ROUNDS:
+                        state["net"] = True
+                        break
+                    item[1] += 1
+                    item[2] = ex.submit(lookup, item[0], cfg, state["mode"], min(0.5 * item[1], 3))
+                else:
+                    streak = 0
+                    q.popleft()
+                    if res.get("limit_hit"):
+                        state["limit"] = True
+                        break
+                    checked += 1
+                    last_plate = item[0]
+                    if res.get("success") and res.get("mobile_number"):
+                        found.append(res)
+            if prog_id and time.time() - last_ping >= PROGRESS_EVERY:
+                tg("editMessageText", chat_id=chat_id, message_id=prog_id, reply_markup=STOP_KB,
+                   text=_progress_text(checked, len(found), target, last_plate, started))
+                last_ping = time.time()
+    finally:
+        ev.set()  # wakes nothing, just marks scan over
+        ex.shutdown(wait=False, cancel_futures=True)
+    if prog_id:
+        tg("editMessageText", chat_id=chat_id, message_id=prog_id,
+           text=_progress_text(checked, len(found), target, last_plate, started).split("\n\n⛔")[0] + "\n\n🏁 Scan finished")
+    return found[:target], checked, last_plate, state
+
+
+def run_bulk(chat_id, vehicle, target, requester="", ev=None):
     cfg = active_config()
     if not cfg or not cfg.get("url_template"):
         send(chat_id, "⚠️ No API configured. Admin: use /setapi first.")
         return 0
+    ev = ev or threading.Event()
     prefix, start, width = split_plate(vehicle)
+    started = time.time()
+    mode = pick_route(cfg, vehicle)
     send(chat_id,
          "🚀 𝗦𝗖𝗔𝗡 𝗦𝗧𝗔𝗥𝗧𝗘𝗗!\n━━━━━━━━━━━━━━━━\n"
          f"🎯 Target: {target} numbers\n🚗 Start: {vehicle}\n🔌 Source: {cfg['name']}\n"
+         f"⚡ Route: {mode.upper()} · {MAX_WORKERS} parallel\n"
          f"🔎 I'll keep trying the series until {target} numbers are found...\n"
-         "⏳ Please wait, fetching data 🔥")
-
-    found, checked, last_plate = [], 0, vehicle
-    last_ping, offset, stop, limit_hit, net_stop = time.time(), 0, False, False, False
-    while len(found) < target and checked < RC_MAX_SCAN and not stop:
-        remaining = target - len(found)
-        window_n = min(max(remaining * 2, 40), 400)
-        window = [start + offset + i for i in range(window_n)]
-        offset += window_n
-        plates = [f"{prefix}{str(n).zfill(width)}" for n in window]
-        results, _lim = resolve_plates(plates, cfg)
-        for p in plates:  # strict ascending order -> no skip, correct pairing
-            res = results.get(p)
-            if res is None:  # unresolved after all retries (very bad network) -> stop honestly
-                net_stop = True
-                stop = True
-                break
-            if res.get("limit_hit"):
-                limit_hit = True
-                stop = True
-                break
-            checked += 1
-            last_plate = p
-            if res.get("success") and res.get("mobile_number"):
-                found.append(res)
-            if len(found) >= target or checked >= RC_MAX_SCAN:
-                stop = True
-                break
-        if not stop and time.time() - last_ping > 15:
-            send(chat_id, f"⏳ Checked {checked} vehicles 🚗  |  ✅ {len(found)}/{target} found 📞")
-            last_ping = time.time()
+         "⏳ Live count every few seconds 🔥")
+    found, checked, last_plate, st = scan(chat_id, prefix, start, width, target, cfg, mode, ev, started)
+    limit_hit, net_stop, cancelled = st["limit"], st["net"], st["cancel"]
+    reached = len(found) >= target
+    next_plate = f"{prefix}{str(start + checked).zfill(width)}"
+    status = "done" if reached else "limit" if limit_hit else "network" if net_stop else "cancelled" if cancelled else "partial"
+    log_scan(chat_id, requester, vehicle, last_plate, target, len(found), checked, status)
+    if reached:
+        clear_resume(chat_id)
+    else:
+        save_resume(chat_id, next_plate, target - len(found))
+    if net_stop:
+        _route["mode"] = None  # re-detect route next time
 
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -424,19 +540,20 @@ def run_bulk(chat_id, vehicle, target, requester=""):
         w.writerow([r["vehicle_number"], r["mobile_number"]])
     csv_bytes = buf.getvalue().encode("utf-8")
 
-    reached = len(found) >= target
-    summary = (("✅ 𝗗𝗢𝗡𝗘! Target reached 🎉" if reached else "⚠️ Sending the numbers found so far") +
+    summary = (("✅ 𝗗𝗢𝗡𝗘! Target reached 🎉" if reached else
+                ("⛔ 𝗦𝗧𝗢𝗣𝗣𝗘𝗗 by you" if cancelled else "⚠️ Sending the numbers found so far")) +
                f"\n━━━━━━━━━━━━━━━━\n🎯 Target: {target}\n📞 Numbers found: {len(found)}\n"
                f"❌ Empty: {checked - len(found)}\n🚗 Range: {vehicle} → {last_plate}\n"
-               f"🔢 Total checked: {checked}")
+               f"🔢 Total checked: {checked}\n⏱️ Time: {int(time.time() - started)}s")
     if limit_hit:
         summary = ("🚫 𝗔𝗣𝗜 𝗟𝗜𝗠𝗜𝗧 𝗥𝗘𝗔𝗖𝗛𝗘𝗗!\n━━━━━━━━━━━━━━━━\n"
                    f"📞 Found so far: {len(found)}\n🚗 Range: {vehicle} → {last_plate}\n"
                    f"🔢 Checked: {checked}\n\n⏰ API limit used up. Try later or switch API.")
     elif net_stop:
         summary += ("\n\n⚠️ Network/proxy was unstable at this point, so I stopped here instead "
-                    "of skipping any vehicle. Please run /start again to continue from the next series, "
-                    "or use a more stable proxy.")
+                    "of skipping any vehicle.")
+    if not reached:
+        summary += f"\n\n▶️ /resume → continues from {next_plate} for the remaining {target - len(found)}"
 
     if found:
         send_document(chat_id, f"leads_{vehicle}_{target}.csv", csv_bytes, caption=summary)
@@ -448,7 +565,7 @@ def run_bulk(chat_id, vehicle, target, requester=""):
             send_document(channel, f"leads_{vehicle}_{target}.csv", csv_bytes,
                           caption=f"📥 New result\n👤 {requester or chat_id}\n🚗 {vehicle} · 🎯 {target} · 📞 {len(found)}")
     else:
-        send(chat_id, summary + ("" if limit_hit else "\n\n😶 No numbers in this range — admin can switch API (/apilist)."))
+        send(chat_id, summary + ("" if (limit_hit or cancelled) else "\n\n😶 No numbers in this range — admin can switch API (/apilist)."))
     return len(found)
 
 
@@ -457,7 +574,7 @@ ADMIN_MENU = (
     "🛠️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟\n━━━━━━━━━━━━━━━━\n"
     "🔌 /apilist\n➕ /setapi\n✅ /activate <no>\n🔎 /readjson <vehicle>\n\n"
     "👤 /setlimit <chat_id> <limit>\n📊 /userinfo <chat_id>\n⚙️ /setdefault <limit>\n"
-    "📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
+    "📊 /report (last 24h, auto daily 10 PM IST)\n📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
 )
 
 
@@ -499,6 +616,16 @@ def handle(msg):
     name = " ".join(filter(None, [frm.get("first_name"), frm.get("last_name")]))
     username = frm.get("username", "")
 
+    if text.startswith(("/exit", "/stop", "/cancel")):
+        ev = CANCEL.get(chat_id)
+        SESSIONS.pop(chat_id, None)
+        if ev and not ev.is_set():
+            ev.set()
+            send(chat_id, "⛔ Stopping scan... sending the numbers found so far 📄")
+        else:
+            send(chat_id, "ℹ️ No scan running. Send /start to begin 🙂")
+        return
+
     s = SESSIONS.get(chat_id)
     if s and s.get("step", "").startswith("admin_") and not text.startswith("/"):
         if is_admin(chat_id):
@@ -513,6 +640,18 @@ def handle(msg):
             send(chat_id, f"🆔 {chat_id}\n📞 limit: {u['lim']} · used: {u['used']} · left: {max(u['lim']-u['used'],0)}")
         return
 
+    if text.startswith("/resume"):
+        r = get_resume(chat_id)
+        running = CANCEL.get(chat_id)
+        if running and not running.is_set():
+            send(chat_id, "⏳ A scan is already running. Wait or send /exit to stop it."); return
+        if not r or r["remaining"] <= 0:
+            send(chat_id, "ℹ️ Nothing to resume. Send /start to begin 🙂"); return
+        SESSIONS.pop(chat_id, None)
+        send(chat_id, f"▶️ Resuming from {r['next_plate']} · remaining {r['remaining']} numbers")
+        start_scan(chat_id, r["next_plate"], r["remaining"], name, username)
+        return
+
     if text.startswith("/admin") or text.startswith("/menu"):
         if admin_count() == 0:
             add_admin(chat_id)
@@ -524,6 +663,8 @@ def handle(msg):
         return
 
     if is_admin(chat_id):
+        if text.startswith("/report"):
+            send(chat_id, daily_report_text()); return
         if text.startswith("/apilist"):
             send(chat_id, fmt_apilist()); return
         if text.startswith("/setapi"):
@@ -545,13 +686,11 @@ def handle(msg):
                 send(chat_id, "No active API."); return
             veh = normalize_vehicle(p[1]) or p[1].upper()
             t = cfg["url_template"].replace("{VEH}", veh)
-            use_relay = RELAY_PREFIX and not USE_PROXY
-            url = (RELAY_PREFIX + t) if use_relay else t
-            hdr = {"X-Return-Format": "text"} if use_relay else {}
             try:
-                raw = _extract_json(SESSION.get(url, timeout=(10, 45), headers=hdr, proxies=_pick_proxy() if USE_PROXY else None).text)
+                mode = pick_route(cfg, veh)
+                raw = _extract_json(fetch(t, mode).text)
                 mob = get_path(raw, cfg["mobile_path"]) if raw else None
-                send(chat_id, f"🔎 {cfg['name']} — {veh}\n📞 {cfg['mobile_path']} → {mob}\n\n🧾 {json.dumps(raw, indent=2, ensure_ascii=False)[:3500]}")
+                send(chat_id, f"🔎 {cfg['name']} — {veh} · route {mode}\n📞 {cfg['mobile_path']} → {mob}\n\n🧾 {json.dumps(raw, indent=2, ensure_ascii=False)[:3500]}")
             except Exception as e:
                 send(chat_id, f"⚠️ {type(e).__name__}: {e}")
             return
@@ -623,26 +762,97 @@ def handle(msg):
         d = re.sub(r"\D", "", text)
         if not d or int(d) < 1:
             send(chat_id, "❗ Send a valid number 🔢 (e.g. 100)"); return
-        target = int(d); vehicle = s["series"]; SESSIONS.pop(chat_id, None)
-        if is_admin(chat_id):
-            effective = target
-        else:
-            u = get_user(chat_id, name, username)
-            left = max(u["lim"] - u["used"], 0)
-            if left <= 0:
-                send(chat_id, f"🔒 Your RC limit is over.\n📞 limit:{u['lim']} used:{u['used']}\n🆔 Your chat id: {chat_id}\nAsk the admin to unlock more."); return
-            effective = min(target, left)
-            if effective < target:
-                send(chat_id, f"ℹ️ You asked {target}, only {left} left. Fetching {effective}.")
-        try:
-            got = run_bulk(chat_id, vehicle, effective, requester=f"{name} @{username} ({chat_id})")
-            if not is_admin(chat_id) and got:
-                add_used(chat_id, got)
-                u = user_info(chat_id)
-                send(chat_id, f"📊 RC balance → used:{u['used']} left:{max(u['lim']-u['used'],0)}")
-        except Exception as e:
-            send(chat_id, f"⚠️ Something went wrong: {e}")
+        SESSIONS.pop(chat_id, None)
+        start_scan(chat_id, s["series"], int(d), name, username)
         return
+
+
+def start_scan(chat_id, vehicle, target, name, username):
+    running = CANCEL.get(chat_id)
+    if running and not running.is_set():
+        send(chat_id, "⏳ A scan is already running. Wait or send /exit to stop it."); return
+    if is_admin(chat_id):
+        effective = target
+    else:
+        u = get_user(chat_id, name, username)
+        left = max(u["lim"] - u["used"], 0)
+        if left <= 0:
+            send(chat_id, f"🔒 Your RC limit is over.\n📞 limit:{u['lim']} used:{u['used']}\n🆔 Your chat id: {chat_id}\nAsk the admin to unlock more."); return
+        effective = min(target, left)
+        if effective < target:
+            send(chat_id, f"ℹ️ You asked {target}, only {left} left. Fetching {effective}.")
+    ev = threading.Event()
+    CANCEL[chat_id] = ev
+    threading.Thread(target=_scan_job, args=(chat_id, vehicle, effective, f"{name} @{username} ({chat_id})", ev),
+                     daemon=True).start()
+
+
+def _scan_job(chat_id, vehicle, effective, requester, ev):
+    # runs in background so the bot keeps reading /exit and the STOP button
+    try:
+        got = run_bulk(chat_id, vehicle, effective, requester=requester, ev=ev)
+        if not is_admin(chat_id) and got:
+            add_used(chat_id, got)
+            u = user_info(chat_id)
+            send(chat_id, f"📊 RC balance → used:{u['used']} left:{max(u['lim']-u['used'],0)}")
+    except Exception as e:
+        send(chat_id, f"⚠️ Something went wrong: {e}")
+    finally:
+        ev.set()
+        if CANCEL.get(chat_id) is ev:
+            CANCEL.pop(chat_id, None)
+
+
+def handle_callback(cb):
+    chat_id = cb["message"]["chat"]["id"]
+    ev = CANCEL.get(chat_id)
+    if cb.get("data") == "stop_scan" and ev and not ev.is_set():
+        ev.set()
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text="Stopping... ⛔")
+        send(chat_id, "⛔ Stopping scan... sending the numbers found so far 📄")
+    else:
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text="No scan running")
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def daily_report_text():
+    since = time.time() - 86400
+    with _lock:
+        tot = _db.execute("SELECT COUNT(*) n, COALESCE(SUM(found),0) f, COALESCE(SUM(checked),0) c, "
+                          "COUNT(DISTINCT chat_id) u FROM scans WHERE ts>=?", (since,)).fetchone()
+        top = _db.execute("SELECT chat_id, MAX(requester) who, COUNT(*) n, SUM(found) f FROM scans WHERE ts>=? "
+                          "GROUP BY chat_id ORDER BY f DESC LIMIT 5", (since,)).fetchall()
+        stops = _db.execute("SELECT status, COUNT(*) n FROM scans WHERE ts>=? GROUP BY status", (since,)).fetchall()
+    lines = [f"📊 𝗗𝗔𝗜𝗟𝗬 𝗥𝗘𝗣𝗢𝗥𝗧 · {datetime.now(IST).strftime('%d %b %Y')}", "━━━━━━━━━━━━━━━━",
+             f"🔁 Scans: {tot['n']}", f"📞 Numbers found: {tot['f']}", f"🚗 Vehicles checked: {tot['c']}",
+             f"👥 Active users: {tot['u']}"]
+    if stops:
+        lines.append("🧾 " + " · ".join(f"{r['status']}: {r['n']}" for r in stops))
+    if top:
+        lines += ["", "🏆 𝗧𝗢𝗣 𝗨𝗦𝗘𝗥𝗦"] + [f"{i+1}. {r['who'] or r['chat_id']} — 📞 {r['f']} ({r['n']} scans)"
+                                         for i, r in enumerate(top)]
+    else:
+        lines.append("\n😴 No scans in the last 24 hours.")
+    return "\n".join(lines)
+
+
+def report_loop():
+    while True:
+        try:
+            now = datetime.now(IST)
+            today = now.strftime("%Y-%m-%d")
+            if now.hour >= REPORT_HOUR and setting("last_report", "") != today:
+                set_setting("last_report", today)
+                text = daily_report_text()
+                with _lock:
+                    admins = [r["chat_id"] for r in _db.execute("SELECT chat_id FROM admins").fetchall()]
+                for a in admins:
+                    send(a, text)
+        except Exception as e:
+            print("report error:", e, flush=True)
+        time.sleep(30)
 
 
 # ----------------------------- Polling loop ----------------------------------
@@ -651,17 +861,18 @@ def main():
         sys.exit("FATAL: TELEGRAM_BOT_TOKEN env var is NOT set. Add it and restart.")
     db_init()
     tg("deleteWebhook", drop_pending_updates=False)
+    threading.Thread(target=report_loop, daemon=True).start()
     me = tg("getMe")
     if not me.get("ok"):
         print("FATAL: getMe failed -> token is probably wrong:", me)
         sys.exit(1)
     print("Bot live:", me["result"].get("username"),
-          "| transport:", ("proxy x" + str(len(PROXY_LIST))) if USE_PROXY else (RELAY_PREFIX or "direct"),
+          "| transport:", TRANSPORT, "| proxies:", len(PROXY_LIST), "| relay:", RELAY_PREFIX or "off",
           "| workers:", MAX_WORKERS, flush=True)
     offset = None
     while True:
         try:
-            params = {"timeout": 25, "allowed_updates": ["message"]}
+            params = {"timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])}
             if offset:
                 params["offset"] = offset
             r = SESSION.get(f"{TG}/getUpdates", params=params, timeout=40).json()
@@ -673,11 +884,13 @@ def main():
             for upd in r["result"]:
                 offset = upd["update_id"] + 1
                 m = upd.get("message")
-                if m and "text" in m:
-                    try:
+                try:
+                    if m and "text" in m:
                         handle(m)
-                    except Exception as e:
-                        print("handle error:", e, flush=True)
+                    elif upd.get("callback_query"):
+                        handle_callback(upd["callback_query"])
+                except Exception as e:
+                    print("handle error:", e, flush=True)
         except KeyboardInterrupt:
             break
         except Exception as e:

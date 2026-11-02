@@ -78,7 +78,7 @@ def env(monkeypatch):
         rc._db.commit()
     rc.SESSIONS.clear()
     sent, docs = [], []
-    monkeypatch.setattr(rc, "send", lambda cid, text: sent.append((cid, text)) or {"ok": True})
+    monkeypatch.setattr(rc, "send", lambda cid, text, reply_markup=None: sent.append((cid, text)) or {"ok": True})
     monkeypatch.setattr(rc, "send_document",
                         lambda cid, fn, content, caption="": docs.append((cid, fn, content, caption)) or {"ok": True})
     monkeypatch.setattr(rc.time, "sleep", lambda s: None)
@@ -131,7 +131,7 @@ def test_lookup_error_flag(monkeypatch):
     def boom(*a, **k):
         raise ConnectionError("x")
     monkeypatch.setattr(rc.SESSION, "get", boom)
-    r = rc.lookup("WB01AB4050", rc.active_config())
+    r = rc.lookup("WB01AB4050", rc.active_config(), "proxy")
     assert r["error"] is True and r["success"] is False and r["mobile_number"] == ""
 
 
@@ -139,9 +139,9 @@ def test_lookup_success_and_empty(monkeypatch):
     fg, _ = make_get()
     monkeypatch.setattr(rc.SESSION, "get", fg)
     cfg = rc.active_config()
-    r = rc.lookup("WB01AB4050", cfg)
+    r = rc.lookup("WB01AB4050", cfg, "proxy")
     assert r["success"] and r["mobile_number"] == mobile_for("WB01AB4050") and not r["error"]
-    r2 = rc.lookup("WB01AB4049", cfg)
+    r2 = rc.lookup("WB01AB4049", cfg, "proxy")
     assert not r2["success"] and not r2["error"] and not r2["limit_hit"]
 
 
@@ -195,7 +195,7 @@ def test_limit_hit_no_results(env, monkeypatch):
 def test_lookup_limit_flag(monkeypatch):
     fg, _ = make_get(limit_after=0)
     monkeypatch.setattr(rc.SESSION, "get", fg)
-    r = rc.lookup("WB01AB4049", rc.active_config())
+    r = rc.lookup("WB01AB4049", rc.active_config(), "proxy")
     assert r["limit_hit"] is True
 
 
@@ -207,7 +207,7 @@ def msg(cid, text):
 def test_admin_bootstrap_and_limits(env, monkeypatch):
     sent, docs = env
     calls = []
-    monkeypatch.setattr(rc, "run_bulk", lambda cid, v, t, requester="": calls.append((cid, v, t)) or t)
+    monkeypatch.setattr(rc, "run_bulk", lambda cid, v, t, requester="", ev=None: calls.append((cid, v, t)) or t)
     assert rc.admin_count() == 0
     rc.handle(msg(100, "/admin"))
     assert rc.is_admin(100)
@@ -247,7 +247,7 @@ def test_partial_found_charges_only_found(env, monkeypatch):
     sent, docs = env
     rc.add_admin(1)
     rc.set_user_limit(300, 10)
-    monkeypatch.setattr(rc, "run_bulk", lambda cid, v, t, requester="": 3)
+    monkeypatch.setattr(rc, "run_bulk", lambda cid, v, t, requester="", ev=None: 3)
     rc.handle(msg(300, "/start")); rc.handle(msg(300, "WB01AB4049")); rc.handle(msg(300, "10"))
     assert rc.user_info(300)["used"] == 3
     rc.handle(msg(300, "/myid"))
