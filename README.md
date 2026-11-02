@@ -130,3 +130,9 @@ sudo journalctl -u rcbot -f     # logs
 - Auto route switch: scan ke beech DIRECT fail ho (lagatar 6 errors) to PROXY pe, woh bhi fail to RELAY pe — usi gaadi se continue.
 - Daily report: raat 10 baje (IST) sab admins ko 24 ghante ka summary (scans, numbers, top 5 users). Kabhi bhi: `/report`.
 - Optional env: `SWITCH_AFTER=6`, `REPORT_HOUR=22`.
+
+## 🌐 v5 — Admin se proxy (koi file edit nahi)
+- `/addproxy` → proxy bhejo jaisa site ne diya: `ip:port:login:password` (ya `login:password@ip:port`). Bot pehle API pe test karta hai, chala to hi save.
+- `/proxylist` · `/delproxy <no|all>` · `/testproxy`
+- `/setworkers <n>` → parallel requests. 1 fixed-IP proxy = 3-4, rotating residential = 20-30.
+- Proxy database (rc_bot.db) me save hota hai, restart ke baad bhi rehta hai. SOCKS5 bhi chalta hai.

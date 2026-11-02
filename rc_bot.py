@@ -82,7 +82,7 @@ PROXY_LIST = [p.strip() for p in re.split(r"[,\n]", os.environ.get("PROXY_LIST",
 _single_proxy = os.environ.get("PROXY_URL", "").strip()
 if _single_proxy and _single_proxy not in PROXY_LIST:
     PROXY_LIST.append(_single_proxy)
-USE_PROXY = len(PROXY_LIST) > 0
+USE_PROXY = len(PROXY_LIST) > 0  # env-only flag at boot; live check uses bool(PROXY_LIST)
 
 TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -124,6 +124,7 @@ def db_init():
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, requester TEXT,
                 start_plate TEXT, last_plate TEXT, target INTEGER, found INTEGER,
                 checked INTEGER, status TEXT, ts REAL);
+            CREATE TABLE IF NOT EXISTS proxies(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT UNIQUE);
             CREATE TABLE IF NOT EXISTS resume_state(
                 chat_id INTEGER PRIMARY KEY, next_plate TEXT, remaining INTEGER, ts REAL);
             """
@@ -141,6 +142,84 @@ def db_init():
         a = a.strip()
         if a:
             add_admin(int(a))
+    for p in db_proxies():
+        if p not in PROXY_LIST:
+            PROXY_LIST.append(p)
+
+
+IP_RE = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|[a-z0-9.-]+\.[a-z]{2,})$", re.I)
+
+
+def parse_proxy(raw):
+    # accepts ip:port:login:pass | login:pass@ip:port | login:pass:ip:port | ip:port | http(s)/socks5 links
+    t = (raw or "").strip()
+    scheme = "http"
+    m = re.match(r"^(https?|socks5h?)://(.+)$", t, re.I)
+    if m:
+        scheme, t = m.group(1).lower(), m.group(2)
+    if scheme == "socks5":
+        scheme = "socks5h"
+    if "@" in t:
+        auth, host = t.rsplit("@", 1)
+        hp = host.split(":")
+        if len(hp) != 2 or not hp[1].isdigit():
+            return None
+        return f"{scheme}://{auth}@{host}"
+    parts = t.split(":")
+    if len(parts) == 2 and parts[1].isdigit() and IP_RE.match(parts[0]):
+        return f"{scheme}://{parts[0]}:{parts[1]}"
+    if len(parts) >= 4:
+        if IP_RE.match(parts[0]) and parts[1].isdigit():
+            return f"{scheme}://{parts[2]}:{':'.join(parts[3:])}@{parts[0]}:{parts[1]}"
+        if IP_RE.match(parts[-2]) and parts[-1].isdigit():
+            return f"{scheme}://{parts[0]}:{':'.join(parts[1:-2])}@{parts[-2]}:{parts[-1]}"
+    return None
+
+
+def mask_proxy(url):
+    return re.sub(r"(://[^:@/]+:)[^@]+@", r"\1****@", url)
+
+
+def db_proxies():
+    with _lock:
+        return [r["url"] for r in _db.execute("SELECT url FROM proxies ORDER BY id").fetchall()]
+
+
+def add_proxy_db(url):
+    with _lock:
+        _db.execute("INSERT OR IGNORE INTO proxies(url) VALUES(?)", (url,))
+        _db.commit()
+    if url not in PROXY_LIST:
+        PROXY_LIST.append(url)
+    _route["mode"] = None
+
+
+def del_proxy_db(url):
+    with _lock:
+        _db.execute("DELETE FROM proxies WHERE url=?", (url,))
+        _db.commit()
+    if url in PROXY_LIST:
+        PROXY_LIST.remove(url)
+    _route["mode"] = None
+
+
+def test_proxy(url, cfg, vehicle="HR76E2990"):
+    px = {"http": url, "https": url}
+    t0 = time.time()
+    try:
+        r = SESSION.get(cfg["url_template"].replace("{VEH}", vehicle), proxies=px, timeout=(8, 25))
+        ms = int((time.time() - t0) * 1000)
+        if _extract_json(r.text) is not None:
+            return True, f"API reply OK in {ms} ms"
+        return False, f"proxy works but API sent no JSON (HTTP {r.status_code})"
+    except requests.exceptions.ProxyError as e:
+        if "407" in str(e) or "auth" in str(e).lower():
+            return False, "login/password wrong or proxy not active (407 auth failed)"
+        return False, "proxy refused connection"
+    except requests.exceptions.ConnectTimeout:
+        return False, "proxy not reachable (timeout)"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:120]}"
 
 
 def setting(key, default=""):
@@ -369,7 +448,7 @@ _route = {"mode": None, "at": 0.0}
 
 def pick_route(cfg, vehicle):
     # auto: try DIRECT first (fastest, works on most VPS). Blocked -> proxy -> relay.
-    if TRANSPORT in ("direct", "relay") or (TRANSPORT == "proxy" and USE_PROXY):
+    if TRANSPORT in ("direct", "relay") or (TRANSPORT == "proxy" and PROXY_LIST):
         return TRANSPORT
     if _route["mode"] and time.time() - _route["at"] < 600:
         return _route["mode"]
@@ -381,7 +460,7 @@ def pick_route(cfg, vehicle):
     except Exception:
         pass
     if not mode:
-        mode = "proxy" if USE_PROXY else ("relay" if RELAY_PREFIX else "direct")
+        mode = "proxy" if PROXY_LIST else ("relay" if RELAY_PREFIX else "direct")
     _route.update(mode=mode, at=time.time())
     print("route selected:", mode, flush=True)
     return mode
@@ -435,7 +514,7 @@ def _progress_text(checked, found, target, last_plate, started):
 def _fallback(mode):
     # direct -> proxy -> relay
     chain = [m for m in ("direct", "proxy", "relay")
-             if m == "direct" or (m == "proxy" and USE_PROXY) or (m == "relay" and RELAY_PREFIX)]
+             if m == "direct" or (m == "proxy" and PROXY_LIST) or (m == "relay" and RELAY_PREFIX)]
     return chain[chain.index(mode) + 1] if mode in chain and chain.index(mode) + 1 < len(chain) else None
 
 
@@ -446,7 +525,8 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
     state = {"limit": False, "net": False, "cancel": False, "mode": mode}
     streak = 0
     q, nxt, last_ping = deque(), 0, time.time()
-    workers = min(MAX_WORKERS, 8) if (mode == "relay" and not JINA_API_KEY) else MAX_WORKERS  # free relay is rate-limited
+    base_w = int(setting("workers", "") or MAX_WORKERS)  # admin /setworkers overrides env
+    workers = min(base_w, 8) if (mode == "relay" and not JINA_API_KEY) else base_w  # free relay is rate-limited
     ahead = workers * 2
     prog_id = (send(chat_id, _progress_text(0, 0, target, last_plate, started), STOP_KB).get("result") or {}).get("message_id")
     ex = ThreadPoolExecutor(max_workers=workers)
@@ -517,7 +597,7 @@ def run_bulk(chat_id, vehicle, target, requester="", ev=None):
     send(chat_id,
          "🚀 𝗦𝗖𝗔𝗡 𝗦𝗧𝗔𝗥𝗧𝗘𝗗!\n━━━━━━━━━━━━━━━━\n"
          f"🎯 Target: {target} numbers\n🚗 Start: {vehicle}\n🔌 Source: {cfg['name']}\n"
-         f"⚡ Route: {mode.upper()} · {MAX_WORKERS} parallel\n"
+         f"⚡ Route: {mode.upper()} · {int(setting('workers', '') or MAX_WORKERS)} parallel\n"
          f"🔎 I'll keep trying the series until {target} numbers are found...\n"
          "⏳ Live count every few seconds 🔥")
     found, checked, last_plate, st = scan(chat_id, prefix, start, width, target, cfg, mode, ev, started)
@@ -574,7 +654,7 @@ ADMIN_MENU = (
     "🛠️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟\n━━━━━━━━━━━━━━━━\n"
     "🔌 /apilist\n➕ /setapi\n✅ /activate <no>\n🔎 /readjson <vehicle>\n\n"
     "👤 /setlimit <chat_id> <limit>\n📊 /userinfo <chat_id>\n⚙️ /setdefault <limit>\n"
-    "📊 /report (last 24h, auto daily 10 PM IST)\n📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
+    "🌐 /addproxy · /proxylist · /delproxy <no> · /testproxy\n⚡ /setworkers <n>\n📊 /report (last 24h, auto daily 10 PM IST)\n📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
 )
 
 
@@ -590,6 +670,10 @@ def fmt_apilist():
 
 def handle_admin_flow(chat_id, text, s):
     step = s["step"]
+    if step == "admin_proxy":
+        SESSIONS.pop(chat_id, None)
+        admin_add_proxies(chat_id, text)
+        return
     if step == "admin_api_name":
         s["api"] = {"name": text}; s["step"] = "admin_api_url"
         send(chat_id, "🔗 Send the API URL — put {VEH} where the vehicle number goes.\nExample:\nhttps://api.site.com/rc?key=XXXX&num={VEH}")
@@ -606,6 +690,39 @@ def handle_admin_flow(chat_id, text, s):
         add_api(a["name"], a["url_template"], a["mobile_path"], a["vehicle_path"])
         SESSIONS.pop(chat_id, None)
         send(chat_id, f"✅ API saved & activated!\n🔌 {a['name']}\n📞 {a['mobile_path']}\n\nTry: /readjson <vehicle>")
+
+
+def admin_add_proxies(chat_id, text):
+    cfg = active_config()
+    lines = [x for x in re.split(r"[\n,\s]+", text.strip()) if x]
+    if not lines:
+        send(chat_id, PROXY_HELP); return
+    if not cfg:
+        send(chat_id, "⚠️ No active API — add one with /setapi first (needed to test the proxy)."); return
+    for raw in lines:
+        url = parse_proxy(raw)
+        if not url:
+            send(chat_id, f"❗ Format not understood: {raw[:60]}\n\n" + PROXY_HELP); continue
+        send(chat_id, f"🧪 Testing {mask_proxy(url)} ...")
+        ok, info = test_proxy(url, cfg)
+        if ok:
+            add_proxy_db(url)
+            send(chat_id, f"✅ Proxy saved & active!\n🌐 {mask_proxy(url)}\n⚡ {info}\n📦 Total proxies: {len(PROXY_LIST)}")
+        else:
+            send(chat_id, f"❌ Not saved — {info}\n🌐 {mask_proxy(url)}")
+
+
+PROXY_HELP = ("🌐 𝗔𝗗𝗗 𝗣𝗥𝗢𝗫𝗬\n━━━━━━━━━━━━━━━━\nSend it exactly as your proxy site gives it:\n"
+              "• ip:port:login:password\n• login:password@ip:port\n• ip:port\n"
+              "Example:\n151.242.176.12:59100:mylogin:mypass\n\nMultiple? one per line.")
+
+
+def fmt_proxylist():
+    if not PROXY_LIST:
+        return "🌐 No proxy added.\n➕ /addproxy to add one."
+    saved = set(db_proxies())
+    rows = [f"{i+1}. {mask_proxy(p)}{'' if p in saved else '  (env)'}" for i, p in enumerate(PROXY_LIST)]
+    return "🌐 𝗣𝗥𝗢𝗫𝗜𝗘𝗦\n━━━━━━━━━━━━━━━━\n" + "\n".join(rows) + "\n\n🗑️ /delproxy <no|all>  ·  🧪 /testproxy"
 
 
 # ----------------------------- Message handler -------------------------------
@@ -663,6 +780,45 @@ def handle(msg):
         return
 
     if is_admin(chat_id):
+        if text.startswith("/addproxy"):
+            rest = text[len("/addproxy"):].strip()
+            if rest:
+                admin_add_proxies(chat_id, rest)
+            else:
+                SESSIONS[chat_id] = {"step": "admin_proxy"}
+                send(chat_id, PROXY_HELP)
+            return
+        if text.startswith("/setworkers"):
+            p = text.split()
+            if len(p) < 2 or not p[1].isdigit() or not (1 <= int(p[1]) <= 100):
+                send(chat_id, f"Usage: /setworkers <1-100>\nNow: {setting('workers', '') or MAX_WORKERS}\n"
+                              "💡 1 fixed-IP proxy → 2-3 · rotating residential → 20-30"); return
+            set_setting("workers", int(p[1]))
+            send(chat_id, f"✅ Parallel requests set to {p[1]} (next scan)"); return
+        if text.startswith("/proxylist"):
+            send(chat_id, fmt_proxylist()); return
+        if text.startswith("/delproxy"):
+            p = text.split()
+            if len(p) < 2:
+                send(chat_id, "Usage: /delproxy <no|all>\n\n" + fmt_proxylist()); return
+            if p[1].lower() == "all":
+                for u in db_proxies():
+                    del_proxy_db(u)
+                send(chat_id, "🗑️ All saved proxies removed.\n\n" + fmt_proxylist()); return
+            if not p[1].isdigit() or not (1 <= int(p[1]) <= len(PROXY_LIST)):
+                send(chat_id, "❗ Wrong number.\n\n" + fmt_proxylist()); return
+            u = PROXY_LIST[int(p[1]) - 1]
+            if u not in db_proxies():
+                send(chat_id, "ℹ️ This one comes from Railway/VPS variables — remove it there."); return
+            del_proxy_db(u)
+            send(chat_id, f"🗑️ Removed {mask_proxy(u)}\n\n" + fmt_proxylist()); return
+        if text.startswith("/testproxy"):
+            cfg = active_config()
+            if not PROXY_LIST or not cfg:
+                send(chat_id, fmt_proxylist()); return
+            out = [f"{i+1}. {'✅' if ok else '❌'} {mask_proxy(u)} — {info}"
+                   for i, u in enumerate(list(PROXY_LIST)) for ok, info in [test_proxy(u, cfg)]]
+            send(chat_id, "🧪 𝗣𝗥𝗢𝗫𝗬 𝗧𝗘𝗦𝗧\n━━━━━━━━━━━━━━━━\n" + "\n".join(out)); return
         if text.startswith("/report"):
             send(chat_id, daily_report_text()); return
         if text.startswith("/apilist"):
