@@ -136,3 +136,8 @@ sudo journalctl -u rcbot -f     # logs
 - `/proxylist` · `/delproxy <no|all>` · `/testproxy`
 - `/setworkers <n>` → parallel requests. 1 fixed-IP proxy = 3-4, rotating residential = 20-30.
 - Proxy database (rc_bot.db) me save hota hai, restart ke baad bhi rehta hai. SOCKS5 bhi chalta hai.
+
+## ⚡ v7 — /parallel (admin)
+- 🤖 AUTO: chosen number se shuru, API busy ho to kam, smooth ho to wapas upar.
+- ✋ MANUAL: jo number chuna wahi fix, hamesha.
+- Number buttons: 2-30 (ya `/setworkers <1-100>`). Next scan se lagu.

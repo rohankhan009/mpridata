@@ -532,8 +532,9 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
     state = {"limit": False, "net": False, "cancel": False, "mode": mode}
     streak = 0
     q, nxt, last_ping = deque(), 0, time.time()
-    base_w = int(setting("workers", "") or MAX_WORKERS)  # admin /setworkers overrides env
-    workers = min(base_w, 8) if (mode == "relay" and not JINA_API_KEY) else base_w  # free relay is rate-limited
+    base_w = par_workers()  # admin /parallel or /setworkers overrides env
+    auto = par_mode() == "auto"
+    workers = min(base_w, 8) if (auto and mode == "relay" and not JINA_API_KEY) else base_w  # free relay is rate-limited
     ahead = workers * 2
     prog_id = (send(chat_id, _progress_text(0, 0, target, last_plate, started), STOP_KB).get("result") or {}).get("message_id")
     ex = ThreadPoolExecutor(max_workers=workers)
@@ -542,6 +543,8 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
     lim_lock = threading.Lock()
 
     def _feedback(f):
+        if not auto:
+            return  # MANUAL: admin's number stays fixed
         try:
             r = f.result()
         except Exception:
@@ -602,7 +605,8 @@ def scan(chat_id, prefix, start, width, target, cfg, mode, ev, started):
                         found.append(res)
             if prog_id and time.time() - last_ping >= PROGRESS_EVERY:
                 tg("editMessageText", chat_id=chat_id, message_id=prog_id, reply_markup=STOP_KB,
-                   text=_progress_text(checked, len(found), target, last_plate, started, int(lim["v"])))
+                   text=_progress_text(checked, len(found), target, last_plate, started,
+                                      f"{int(lim['v'])} ({'AUTO' if auto else 'MANUAL'})"))
                 last_ping = time.time()
     finally:
         ev.set()  # wakes nothing, just marks scan over
@@ -626,7 +630,7 @@ def run_bulk(chat_id, vehicle, target, requester="", ev=None):
     send(chat_id,
          "🚀 𝗦𝗖𝗔𝗡 𝗦𝗧𝗔𝗥𝗧𝗘𝗗!\n━━━━━━━━━━━━━━━━\n"
          f"🎯 Target: {target} numbers\n🚗 Start: {vehicle}\n🔌 Source: {cfg['name']}\n"
-         f"⚡ Route: {mode.upper()} · {int(setting('workers', '') or MAX_WORKERS)} parallel\n"
+         f"⚡ Route: {mode.upper()} · {par_workers()} parallel ({par_mode().upper()})\n"
          f"🔎 I'll keep trying the series until {target} numbers are found...\n"
          "⏳ Live count every few seconds 🔥")
     found, checked, last_plate, st = scan(chat_id, prefix, start, width, target, cfg, mode, ev, started)
@@ -683,7 +687,7 @@ ADMIN_MENU = (
     "🛠️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟\n━━━━━━━━━━━━━━━━\n"
     "🔌 /apilist\n➕ /setapi\n✅ /activate <no>\n🔎 /readjson <vehicle>\n\n"
     "👤 /setlimit <chat_id> <limit>\n📊 /userinfo <chat_id>\n⚙️ /setdefault <limit>\n"
-    "🌐 /addproxy · /proxylist · /delproxy <no> · /testproxy\n⚡ /setworkers <n>\n📊 /report (last 24h, auto daily 10 PM IST)\n📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
+    "🌐 /addproxy · /proxylist · /delproxy <no> · /testproxy\n⚡ /parallel (AUTO / MANUAL speed)\n📊 /report (last 24h, auto daily 10 PM IST)\n📣 /setchannel <channel_id>\n👑 /addadmin <id> · /deladmin <id>\n\n🆔 /myid"
 )
 
 
@@ -817,6 +821,9 @@ def handle(msg):
                 SESSIONS[chat_id] = {"step": "admin_proxy"}
                 send(chat_id, PROXY_HELP)
             return
+        if text.startswith("/parallel"):
+            t, kb = parallel_panel()
+            send(chat_id, t, kb); return
         if text.startswith("/setworkers"):
             p = text.split()
             if len(p) < 2 or not p[1].isdigit() or not (1 <= int(p[1]) <= 100):
@@ -988,8 +995,51 @@ def _scan_job(chat_id, vehicle, effective, requester, ev):
             CANCEL.pop(chat_id, None)
 
 
+def par_mode():
+    return setting("par_mode", "") or "auto"
+
+
+def par_workers():
+    return int(setting("workers", "") or MAX_WORKERS)
+
+
+PAR_CHOICES = [2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
+
+
+def parallel_panel():
+    m, w = par_mode(), par_workers()
+    text = ("⚡ 𝗣𝗔𝗥𝗔𝗟𝗟𝗘𝗟 𝗦𝗘𝗧𝗧𝗜𝗡𝗚\n━━━━━━━━━━━━━━━━\n"
+            f"Mode: {'🤖 AUTO' if m == 'auto' else '✋ MANUAL'} · Number: {w}\n\n"
+            "🤖 AUTO → starts at this number, goes down when API is busy, back up when smooth\n"
+            "✋ MANUAL → exactly this number, always\n\n"
+            "👇 Pick mode, then tap a number (or /setworkers <1-100>)")
+    mark = lambda on: "✅ " if on else ""
+    kb = [[{"text": mark(m == "auto") + "🤖 AUTO", "callback_data": "par_auto"},
+           {"text": mark(m == "manual") + "✋ MANUAL", "callback_data": "par_manual"}]]
+    row = []
+    for n in PAR_CHOICES:
+        row.append({"text": ("•" if n == w else "") + str(n), "callback_data": f"par_n_{n}"})
+        if len(row) == 6:
+            kb.append(row); row = []
+    if row:
+        kb.append(row)
+    return text, {"inline_keyboard": kb}
+
+
 def handle_callback(cb):
     chat_id = cb["message"]["chat"]["id"]
+    data = cb.get("data", "")
+    if data.startswith("par_"):
+        if not is_admin(chat_id):
+            tg("answerCallbackQuery", callback_query_id=cb["id"], text="Admin only"); return
+        if data in ("par_auto", "par_manual"):
+            set_setting("par_mode", data[4:])
+        elif data.startswith("par_n_") and data[6:].isdigit():
+            set_setting("workers", int(data[6:]))
+        text, kb = parallel_panel()
+        tg("editMessageText", chat_id=chat_id, message_id=cb["message"]["message_id"], text=text, reply_markup=kb)
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text=f"Saved: {par_mode().upper()} · {par_workers()} (next scan)")
+        return
     ev = CANCEL.get(chat_id)
     if cb.get("data") == "stop_scan" and ev and not ev.is_set():
         ev.set()
