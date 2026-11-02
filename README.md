@@ -99,3 +99,20 @@ sudo journalctl -u rcbot -f     # logs
 4. Result file apne channel mein chahiye: bot ko channel mein admin banao,
    phir `/setchannel -100xxxxxxxxxx`.
 5. Normal use: `/start` → gaadi series → kitne number chahiye.
+
+---
+
+## 🛠️ Bot reply nahi kar raha? (troubleshooting)
+1. **Variables tab check karo** — `TELEGRAM_BOT_TOKEN` zaroor set hona chahiye.
+   Yeh #1 wajah hai. Set karne ke baad **Redeploy**.
+2. **Deploy Logs dekho** (service → Deployments → View Logs). Line dikhni chahiye:
+   `Bot live: <username> | relay: ... | workers: ...`
+   - Agar `FATAL: TELEGRAM_BOT_TOKEN env var is NOT set` → token daalo.
+   - Agar `getUpdates not ok: 409 Conflict ...` → **same token kahin aur bhi chal
+     raha hai** (purana deploy / aapka PC / doosra host). Baaki sab band karo —
+     ek token sirf EK jagah chalega.
+3. Token sahi hai? `getMe failed` aaye to @BotFather se token dubara copy karo.
+4. `railway.json` is zip mein hai — Railway isse `python rc_bot.py` auto start
+   karega. Phir bhi na chale to service → Settings → **Start Command** mein
+   `python rc_bot.py` daal do.
+

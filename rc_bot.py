@@ -582,12 +582,14 @@ def handle(msg):
 # ----------------------------- Polling loop ----------------------------------
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        sys.exit("Set TELEGRAM_BOT_TOKEN env var.")
+        sys.exit("FATAL: TELEGRAM_BOT_TOKEN env var is NOT set. Add it and restart.")
     db_init()
-    tg("deleteWebhook")
+    tg("deleteWebhook", drop_pending_updates=False)
     me = tg("getMe")
-    if me.get("ok"):
-        print("Bot live:", me["result"].get("username"), "| relay:", RELAY_PREFIX or "direct", "| workers:", MAX_WORKERS)
+    if not me.get("ok"):
+        print("FATAL: getMe failed -> token is probably wrong:", me)
+        sys.exit(1)
+    print("Bot live:", me["result"].get("username"), "| relay:", RELAY_PREFIX or "direct", "| workers:", MAX_WORKERS, flush=True)
     offset = None
     while True:
         try:
@@ -596,7 +598,10 @@ def main():
                 params["offset"] = offset
             r = SESSION.get(f"{TG}/getUpdates", params=params, timeout=40).json()
             if not r.get("ok"):
-                time.sleep(3); continue
+                # 409 = another instance is polling the same bot token
+                print("getUpdates not ok:", r.get("error_code"), r.get("description"), flush=True)
+                time.sleep(3)
+                continue
             for upd in r["result"]:
                 offset = upd["update_id"] + 1
                 m = upd.get("message")
@@ -604,11 +609,11 @@ def main():
                     try:
                         handle(m)
                     except Exception as e:
-                        print("handle error:", e)
+                        print("handle error:", e, flush=True)
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print("poll error:", e)
+            print("poll error:", e, flush=True)
             time.sleep(3)
 
 
