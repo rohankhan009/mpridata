@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 import requests
 
 # ----------------------------- Config ----------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9010080670:AAFMS2pHpKFWKaW3hYoefBcTxFObzNtJjro").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 SUPER_ADMINS = os.environ.get("SUPER_ADMINS", "8922842091")
 RELAY_PREFIX = os.environ.get("RELAY_PREFIX", "https://r.jina.ai/").strip()
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "6"))
@@ -60,17 +60,36 @@ JINA_API_KEY = os.environ.get("JINA_API_KEY", "").strip()
 RC_DB = os.environ.get("RC_DB", "rc_bot.db")
 RC_MAX_SCAN = int(os.environ.get("RC_MAX_SCAN", "1000000"))
 
+# Proxy pool: PROXY_LIST (comma/newline separated) or single PROXY_URL.
+# If any proxy is set, we go DIRECT through a rotating proxy (relay is skipped) —
+# this is the fastest path and bypasses IP/SNI blocks.
+import random
+
+PROXY_LIST = [p.strip() for p in re.split(r"[,\n]", os.environ.get("PROXY_LIST", "")) if p.strip()]
+_single_proxy = os.environ.get("PROXY_URL", "").strip()
+if _single_proxy and _single_proxy not in PROXY_LIST:
+    PROXY_LIST.append(_single_proxy)
+USE_PROXY = len(PROXY_LIST) > 0
+
 TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 SESSION = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
 SESSION.mount("http://", _adapter)
 SESSION.mount("https://", _adapter)
+
+
+def _pick_proxy():
+    if PROXY_LIST:
+        p = random.choice(PROXY_LIST)
+        return {"http": p, "https": p}
+    return None
+
 
 SESSIONS = {}  # chat_id -> conversation state (in memory)
 
 # ----------------------------- SQLite -----------------------------------------
-_lock = threading.Lock()
+_lock = threading.RLock()  # re-entrant: get_user() -> default_limit() -> setting() nests the lock
 _db = sqlite3.connect(RC_DB, check_same_thread=False)
 _db.row_factory = sqlite3.Row
 
@@ -282,20 +301,21 @@ def _extract_json(text):
 
 
 def lookup(vehicle, cfg, retries=3):
-    out = {"vehicle_number": vehicle, "mobile_number": "", "success": False, "limit_hit": False}
+    # out["error"]=True means we NEVER got a valid response (transient/proxy fail)
+    # -> caller must re-queue it, NOT treat as "no data" (prevents skips).
+    out = {"vehicle_number": vehicle, "mobile_number": "", "success": False, "limit_hit": False, "error": False}
     target = cfg["url_template"].replace("{VEH}", vehicle)
-    url = (RELAY_PREFIX + target) if RELAY_PREFIX else target
-    headers = {"X-Return-Format": "text"} if RELAY_PREFIX else {}
-    if RELAY_PREFIX and JINA_API_KEY:
+    use_relay = RELAY_PREFIX and not USE_PROXY
+    url = (RELAY_PREFIX + target) if use_relay else target
+    headers = {"X-Return-Format": "text"} if use_relay else {}
+    if use_relay and JINA_API_KEY:
         headers["Authorization"] = "Bearer " + JINA_API_KEY
     for attempt in range(retries):
         try:
-            r = SESSION.get(url, timeout=(10, 45), headers=headers)
-            if r.status_code in (429, 451, 502, 503, 504) or (RELAY_PREFIX and r.status_code >= 500):
+            proxies = _pick_proxy() if USE_PROXY else None
+            r = SESSION.get(url, timeout=(10, 45), headers=headers, proxies=proxies)
+            if r.status_code in (429, 451, 502, 503, 504) or (use_relay and r.status_code >= 500):
                 raise ValueError("transient")
-            if not RELAY_PREFIX and r.status_code == 429:
-                out["limit_hit"] = True
-                return out
             body = r.text.strip()
             if not body:
                 raise ValueError("empty")
@@ -304,10 +324,12 @@ def lookup(vehicle, cfg, retries=3):
                 raise ValueError("no json")
         except Exception:
             if attempt < retries - 1:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.3 * (attempt + 1))  # retry, rotate to another proxy
                 continue
+            out["error"] = True  # could not get a definitive answer
             return out
         if not isinstance(data, dict):
+            out["error"] = True
             return out
         blob = str(data).lower()
         if data.get("code") == "KEY_LIMIT_REACHED" or "api key limit" in blob \
@@ -318,8 +340,39 @@ def lookup(vehicle, cfg, retries=3):
         if mobile:
             out["mobile_number"] = mobile
             out["success"] = True
-        return out
+        return out  # definitive (data or confirmed-empty)
+    out["error"] = True
     return out
+
+
+def resolve_plates(plates, cfg):
+    """Return (results_by_plate, limit_hit). Errored plates are retried across
+    several rounds (rotating proxies) so a flaky network NEVER causes a skip.
+    Even if a limit response appears, flaky plates BEFORE it keep retrying, so
+    data plates are resolved; limit plates are marked so run_bulk stops at them."""
+    pending = list(plates)
+    results = {}
+    limit_hit = False
+    for _ in range(12):  # up to 12 rounds of re-queue for stubborn/flaky ones
+        if not pending:
+            break
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            outs = list(ex.map(lambda v: lookup(v, cfg), pending))
+        nxt = []
+        for v, res in zip(pending, outs):
+            if res.get("limit_hit"):
+                limit_hit = True
+                results[v] = res  # mark this plate as a limit boundary
+            elif res.get("error"):
+                nxt.append(v)  # retry next round (flaky) — do NOT give up
+            else:
+                results[v] = res  # definitive data / empty
+        pending = nxt
+        if pending:
+            time.sleep(0.5)
+    # Anything still failing after all rounds is left ABSENT (not marked empty),
+    # so run_bulk stops honestly at it instead of silently skipping a possible data plate.
+    return results, limit_hit
 
 
 def run_bulk(chat_id, vehicle, target, requester=""):
@@ -335,26 +388,34 @@ def run_bulk(chat_id, vehicle, target, requester=""):
          "⏳ Please wait, fetching data 🔥")
 
     found, checked, last_plate = [], 0, vehicle
-    last_ping, offset, stop, limit_hit = time.time(), 0, False, False
-    chunk = max(MAX_WORKERS * 4, 40)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        while len(found) < target and checked < RC_MAX_SCAN and not stop:
-            batch = [f"{prefix}{str(start + offset + i).zfill(width)}" for i in range(chunk)]
-            offset += chunk
-            for r in ex.map(lambda v: lookup(v, cfg), batch):
-                if r.get("limit_hit"):
-                    limit_hit = stop = True
-                    break
-                checked += 1
-                last_plate = r.get("vehicle_number", last_plate)
-                if r.get("success") and r.get("mobile_number"):
-                    found.append(r)
-                if len(found) >= target or checked >= RC_MAX_SCAN:
-                    stop = True
-                    break
-            if not stop and time.time() - last_ping > 6:
-                send(chat_id, f"⏳ Checked {checked} vehicles 🚗  |  ✅ {len(found)}/{target} found 📞")
-                last_ping = time.time()
+    last_ping, offset, stop, limit_hit, net_stop = time.time(), 0, False, False, False
+    while len(found) < target and checked < RC_MAX_SCAN and not stop:
+        remaining = target - len(found)
+        window_n = min(max(remaining * 2, 40), 400)
+        window = [start + offset + i for i in range(window_n)]
+        offset += window_n
+        plates = [f"{prefix}{str(n).zfill(width)}" for n in window]
+        results, _lim = resolve_plates(plates, cfg)
+        for p in plates:  # strict ascending order -> no skip, correct pairing
+            res = results.get(p)
+            if res is None:  # unresolved after all retries (very bad network) -> stop honestly
+                net_stop = True
+                stop = True
+                break
+            if res.get("limit_hit"):
+                limit_hit = True
+                stop = True
+                break
+            checked += 1
+            last_plate = p
+            if res.get("success") and res.get("mobile_number"):
+                found.append(res)
+            if len(found) >= target or checked >= RC_MAX_SCAN:
+                stop = True
+                break
+        if not stop and time.time() - last_ping > 15:
+            send(chat_id, f"⏳ Checked {checked} vehicles 🚗  |  ✅ {len(found)}/{target} found 📞")
+            last_ping = time.time()
 
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -372,6 +433,10 @@ def run_bulk(chat_id, vehicle, target, requester=""):
         summary = ("🚫 𝗔𝗣𝗜 𝗟𝗜𝗠𝗜𝗧 𝗥𝗘𝗔𝗖𝗛𝗘𝗗!\n━━━━━━━━━━━━━━━━\n"
                    f"📞 Found so far: {len(found)}\n🚗 Range: {vehicle} → {last_plate}\n"
                    f"🔢 Checked: {checked}\n\n⏰ API limit used up. Try later or switch API.")
+    elif net_stop:
+        summary += ("\n\n⚠️ Network/proxy was unstable at this point, so I stopped here instead "
+                    "of skipping any vehicle. Please run /start again to continue from the next series, "
+                    "or use a more stable proxy.")
 
     if found:
         send_document(chat_id, f"leads_{vehicle}_{target}.csv", csv_bytes, caption=summary)
@@ -480,10 +545,11 @@ def handle(msg):
                 send(chat_id, "No active API."); return
             veh = normalize_vehicle(p[1]) or p[1].upper()
             t = cfg["url_template"].replace("{VEH}", veh)
-            url = (RELAY_PREFIX + t) if RELAY_PREFIX else t
-            hdr = {"X-Return-Format": "text"} if RELAY_PREFIX else {}
+            use_relay = RELAY_PREFIX and not USE_PROXY
+            url = (RELAY_PREFIX + t) if use_relay else t
+            hdr = {"X-Return-Format": "text"} if use_relay else {}
             try:
-                raw = _extract_json(SESSION.get(url, timeout=(10, 45), headers=hdr).text)
+                raw = _extract_json(SESSION.get(url, timeout=(10, 45), headers=hdr, proxies=_pick_proxy() if USE_PROXY else None).text)
                 mob = get_path(raw, cfg["mobile_path"]) if raw else None
                 send(chat_id, f"🔎 {cfg['name']} — {veh}\n📞 {cfg['mobile_path']} → {mob}\n\n🧾 {json.dumps(raw, indent=2, ensure_ascii=False)[:3500]}")
             except Exception as e:
@@ -589,7 +655,9 @@ def main():
     if not me.get("ok"):
         print("FATAL: getMe failed -> token is probably wrong:", me)
         sys.exit(1)
-    print("Bot live:", me["result"].get("username"), "| relay:", RELAY_PREFIX or "direct", "| workers:", MAX_WORKERS, flush=True)
+    print("Bot live:", me["result"].get("username"),
+          "| transport:", ("proxy x" + str(len(PROXY_LIST))) if USE_PROXY else (RELAY_PREFIX or "direct"),
+          "| workers:", MAX_WORKERS, flush=True)
     offset = None
     while True:
         try:
