@@ -58,7 +58,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 # ----------------------------- Config ----------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9010080670:AAFMS2pHpKFWKaW3hYoefBcTxFObzNtJjro").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9010080670:AAFsXXH7nNJPg1furTHhbc2Bl8_NEKsozSo").strip()
 SUPER_ADMINS = os.environ.get("SUPER_ADMINS", "8922842091")
 RELAY_PREFIX = os.environ.get("RELAY_PREFIX", "https://r.jina.ai/").strip()
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "25"))
